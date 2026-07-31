@@ -1,0 +1,104 @@
+name: VisaWatch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # poll the Reddit feeds
+    - cron: "30 3 * * *"     # 09:00 IST - wait times + daily digest
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        type: choice
+        default: test-alert
+        options:
+          - test-alert
+          - poll
+          - daily
+
+concurrency:
+  group: visawatch-state
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide what this run is doing
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "30 3 * * *" ]; then
+            echo "mode=daily" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=poll" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --quiet requests feedparser
+
+      - name: Install browser (daily run only)
+        if: steps.mode.outputs.mode == 'daily'
+        run: |
+          pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Load what we have already seen
+        if: steps.mode.outputs.mode != 'test-alert'
+        run: |
+          if git fetch --depth=1 origin state 2>/dev/null && \
+             git show FETCH_HEAD:state.json > state.json 2>/dev/null; then
+            echo "Loaded state ($(wc -c < state.json) bytes)."
+          else
+            echo '{}' > state.json
+            echo "No saved state yet - starting fresh."
+          fi
+
+      - name: Run VisaWatch
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+          SMTP_HOST:  ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:  ${{ secrets.SMTP_PORT }}
+          SMTP_USER:  ${{ secrets.SMTP_USER }}
+          SMTP_PASS:  ${{ secrets.SMTP_PASS }}
+          SMTP_FROM:  ${{ secrets.SMTP_FROM }}
+        run: python -m visawatch ${{ steps.mode.outputs.mode }}
+
+      # Saved to a separate "state" branch holding exactly one commit, so this
+      # runs 288 times a day without piling up history or hitting merge races.
+      - name: Remember what we have seen
+        if: always() && steps.mode.outputs.mode != 'test-alert'
+        run: |
+          set -uo pipefail
+          [ -f state.json ] || { echo "Nothing to save."; exit 0; }
+
+          git config user.name  "visawatch-bot"
+          git config user.email "visawatch-bot@users.noreply.github.com"
+
+          git checkout --quiet --orphan state-tmp
+          git rm -rq --cached . || true
+          git add -f state.json
+          git commit --quiet -m "VisaWatch state"
+
+          for attempt in 1 2 3; do
+            if git push --quiet --force origin state-tmp:state; then
+              echo "State saved ($(wc -c < state.json) bytes)."
+              exit 0
+            fi
+            echo "Save attempt ${attempt} failed; retrying in 5s."
+            sleep 5
+          done
+          echo "::warning::Could not save state this cycle."
+          exit 0
