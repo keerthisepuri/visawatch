@@ -32,7 +32,24 @@ BLOCKED_DOMAINS = (
 
 REQUEST_TIMEOUT = 25
 # How long to stay away from a source after it tells us to slow down.
-BACKOFF_SECONDS = {429: 15 * 60, 403: 30 * 60}
+BACKOFF_SECONDS = {429: 30 * 60, 403: 30 * 60}
+MAX_BACKOFF_SECONDS = 6 * 60 * 60
+
+
+def _retry_after_seconds(resp) -> float:
+    """Honour the server's own Retry-After when it sends one."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+
+            return max(0.0, (parsedate_to_datetime(raw) - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            return 0.0
 
 
 class BlockedDomainError(RuntimeError):
@@ -183,12 +200,14 @@ def fetch_feed(name: str, url: str, session: requests.Session | None = None) -> 
         return FetchResult(name, False, [], f"network error: {exc}")
 
     if resp.status_code in BACKOFF_SECONDS:
+        wait = max(BACKOFF_SECONDS[resp.status_code], _retry_after_seconds(resp))
+        wait = min(wait, MAX_BACKOFF_SECONDS)
         return FetchResult(
             name,
             False,
             [],
-            f"HTTP {resp.status_code} - backing off, not retrying",
-            backoff_until=_time.time() + BACKOFF_SECONDS[resp.status_code],
+            f"HTTP {resp.status_code} - backing off {int(wait / 60)} min, not retrying",
+            backoff_until=_time.time() + wait,
         )
     if resp.status_code != 200:
         return FetchResult(name, False, [], f"HTTP {resp.status_code}")
