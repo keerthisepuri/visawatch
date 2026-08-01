@@ -13,17 +13,25 @@ from .sources import fetch_feed
 from . import waittimes as wt
 
 
-# Reddit rate-limits bursts from data-centre IPs: the first request in a cycle
-# succeeds and the rest get HTTP 429. So we ask for fewer feeds per cycle, and
-# pause between them. The comments feed carries the megathread slot reports, so
-# it is read every cycle; the others take turns.
+# Reddit rate-limits data-centre IPs hard: measured live, the FIRST request of a
+# cycle succeeds and the second gets HTTP 429 even six seconds later. So we make
+# exactly one request per cycle.
+#
+# That is a hard budget of 12 requests an hour, so it has to be spent where the
+# time-critical reports are. The comments feed carries the megathread slot
+# reports, so it takes three cycles out of every four - a read every ~7 minutes.
+# The fourth cycle rotates through the other three feeds, so each of those is
+# read about once an hour. That is fine: they carry whole posts rather than
+# live comments, and a post found an hour late belongs in the digest anyway.
 PRIORITY_SOURCE = "reddit_comments"
-FEEDS_PER_CYCLE = 2
+PRIORITY_SHARE = 3       # out of every PRIORITY_CYCLE cycles
+PRIORITY_CYCLE = 4
+FEEDS_PER_CYCLE = 1
 SECONDS_BETWEEN_REQUESTS = 6
 
 
 def select_sources(cfg, state) -> dict:
-    """Pick which feeds to read this cycle, rotating the non-priority ones."""
+    """Pick which feed to read this cycle."""
     per_cycle = int(getattr(cfg, "feeds_per_cycle", FEEDS_PER_CYCLE))
     names = list(cfg.sources)
     if per_cycle <= 0 or per_cycle >= len(names):
@@ -32,12 +40,19 @@ def select_sources(cfg, state) -> dict:
     cycle = int(state.data.get("cycle", 0))
     state.data["cycle"] = cycle + 1
 
-    chosen = [n for n in names if n == PRIORITY_SOURCE][:per_cycle]
-    others = [n for n in names if n not in chosen]
-    while len(chosen) < per_cycle and others:
-        chosen.append(others[cycle % len(others)])
-        others = [n for n in others if n not in chosen]
-        cycle += 1
+    others = [n for n in names if n != PRIORITY_SOURCE]
+    has_priority = PRIORITY_SOURCE in names
+
+    chosen: list[str] = []
+    if has_priority and (cycle % PRIORITY_CYCLE) < PRIORITY_SHARE:
+        chosen.append(PRIORITY_SOURCE)
+    elif others:
+        chosen.append(others[(cycle // PRIORITY_CYCLE) % len(others)])
+
+    # Top up if the caller asked for more than one feed per cycle.
+    pool = [n for n in names if n not in chosen]
+    while len(chosen) < per_cycle and pool:
+        chosen.append(pool.pop(0))
     return {n: cfg.sources[n] for n in chosen}
 
 
