@@ -13,12 +13,41 @@ from .sources import fetch_feed
 from . import waittimes as wt
 
 
+# Reddit rate-limits bursts from data-centre IPs: the first request in a cycle
+# succeeds and the rest get HTTP 429. So we ask for fewer feeds per cycle, and
+# pause between them. The comments feed carries the megathread slot reports, so
+# it is read every cycle; the others take turns.
+PRIORITY_SOURCE = "reddit_comments"
+FEEDS_PER_CYCLE = 2
+SECONDS_BETWEEN_REQUESTS = 6
+
+
+def select_sources(cfg, state) -> dict:
+    """Pick which feeds to read this cycle, rotating the non-priority ones."""
+    per_cycle = int(getattr(cfg, "feeds_per_cycle", FEEDS_PER_CYCLE))
+    names = list(cfg.sources)
+    if per_cycle <= 0 or per_cycle >= len(names):
+        return dict(cfg.sources)
+
+    cycle = int(state.data.get("cycle", 0))
+    state.data["cycle"] = cycle + 1
+
+    chosen = [n for n in names if n == PRIORITY_SOURCE][:per_cycle]
+    others = [n for n in names if n not in chosen]
+    while len(chosen) < per_cycle and others:
+        chosen.append(others[cycle % len(others)])
+        others = [n for n in others if n not in chosen]
+        cycle += 1
+    return {n: cfg.sources[n] for n in chosen}
+
+
 def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
     """Read every feed once, alert on fresh matches, queue stale ones."""
     now = now or datetime.now(timezone.utc)
     now_unix = _time.time()
     session = requests.Session()
-    stats = {"fetched": 0, "new": 0, "urgent": 0, "queued": 0, "failed": [], "cold_start": False}
+    stats = {"fetched": 0, "new": 0, "urgent": 0, "queued": 0, "requests": 0,
+             "failed": [], "cold_start": False}
 
     # First ever run: the feeds hand us ~100 back-dated items at once. Learn them
     # silently instead of firing a burst of alerts for reports already gone.
@@ -28,10 +57,14 @@ def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
     stats["cold_start"] = cold_start
     any_success = False
 
-    for name, url in cfg.sources.items():
+    for name, url in select_sources(cfg, state).items():
         if state.in_backoff(name, now_unix):
             print(f"{name}: still backing off, skipping this cycle.")
             continue
+
+        if stats["requests"]:
+            _time.sleep(getattr(cfg, "seconds_between_requests", SECONDS_BETWEEN_REQUESTS))
+        stats["requests"] += 1
 
         result = fetch_feed(name, url, session=session)
         if not result.ok:
