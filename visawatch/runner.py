@@ -56,6 +56,50 @@ def select_sources(cfg, state) -> dict:
     return {n: cfg.sources[n] for n in chosen}
 
 
+MIN_FAILURES_BEFORE_ALARM = 3
+
+
+def _parse_ts(raw):
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def failing_sources(cfg, state, now: datetime) -> list[dict]:
+    """Sources that are genuinely broken.
+
+    A feed is 'down' only when every recent attempt to read it FAILED - not when
+    it simply has not come up in the rotation yet. The old rule fired whenever a
+    feed had not been read for an hour, which with a rotating schedule meant a
+    constant stream of false 'source is down' alerts for feeds that were fine.
+    """
+    down = []
+    for name in cfg.sources:
+        rec = state.data.get("sources", {}).get(name, {})
+        fails = int(rec.get("consecutive_failures", 0))
+        since = _parse_ts(rec.get("failing_since"))
+        if fails < MIN_FAILURES_BEFORE_ALARM or since is None:
+            continue
+        broken_minutes = (now - since).total_seconds() / 60.0
+        if broken_minutes < cfg.source_down_after_minutes:
+            continue
+        last_notice = _parse_ts(rec.get("last_down_notice"))
+        if last_notice and (now - last_notice).total_seconds() / 60.0 < cfg.source_down_repeat_minutes:
+            continue
+        down.append(
+            {
+                "name": name,
+                "stale_minutes": int(broken_minutes),
+                "error": f"{rec.get('last_error', 'unknown')} ({fails} failed attempts in a row)",
+            }
+        )
+    return down
+
+
 def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
     """Read every feed once, alert on fresh matches, queue stale ones."""
     now = now or datetime.now(timezone.utc)
@@ -82,14 +126,21 @@ def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
         stats["requests"] += 1
 
         result = fetch_feed(name, url, session=session)
+        rec = state.data.setdefault("sources", {}).setdefault(name, {})
         if not result.ok:
             state.record_failure(name, result.error, now)
+            rec = state.data["sources"][name]
+            rec["consecutive_failures"] = int(rec.get("consecutive_failures", 0)) + 1
+            rec.setdefault("failing_since", now.isoformat())
             state.set_backoff(name, result.backoff_until)
             stats["failed"].append(f"{name}: {result.error}")
             print(f"{name}: FAILED - {result.error}")
             continue
 
         state.record_success(name, now)
+        rec = state.data["sources"][name]
+        rec["consecutive_failures"] = 0
+        rec.pop("failing_since", None)
         any_success = True
         stats["fetched"] += len(result.items)
 
@@ -114,7 +165,9 @@ def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
                 "keywords": m.summary(),
                 "high_priority": m.high_priority,
             }
-            if age <= cfg.urgent_max_age_minutes:
+            # Second safety net: a question or a write-up is never worth a
+            # max-priority push, however fresh it is.
+            if age <= cfg.urgent_max_age_minutes and not m.is_question:
                 try:
                     notifier.urgent(item, m)
                     stats["urgent"] += 1
@@ -134,13 +187,7 @@ def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
     if any_success:
         state.data["initialized"] = True
 
-    # Source-down notices, limited to the feeds this job actually polls.
-    for down in state.sources_down(
-        cfg.source_down_after_minutes,
-        cfg.source_down_repeat_minutes,
-        now,
-        only=list(cfg.sources.keys()),
-    ):
+    for down in failing_sources(cfg, state, now):
         try:
             notifier.source_down(down["name"], down["stale_minutes"], down["error"])
             state.mark_down_notified(down["name"], now)
