@@ -141,25 +141,33 @@ def test_failing_source_produces_source_down_notice(cfg, state, notifier, monkey
     only_one_source(cfg)
     cfg.quiet_hours_enabled = False       # so the notice is not held back
 
-    # It worked 3 hours ago, and has been failing since.
-    state.record_success("reddit_test", datetime.now(timezone.utc) - timedelta(hours=3))
     monkeypatch.setattr(runner, "fetch_feed", stub_fetch([], ok=False, error="HTTP 500"))
 
+    # Three failed attempts in a row, the first of them well over an hour ago.
+    runner.poll(cfg, state, notifier)
+    state.data["sources"]["reddit_test"]["failing_since"] = (
+        datetime.now(timezone.utc) - timedelta(hours=3)
+    ).isoformat()
+    runner.poll(cfg, state, notifier)
     stats = runner.poll(cfg, state, notifier)
 
     assert stats["failed"] == ["reddit_test: HTTP 500"]
     assert len(notifier.sent) == 1
     assert "source is down" in notifier.sent[0]["title"]
     assert "180 minutes" in notifier.sent[0]["body"]
+    assert "3 failed attempts in a row" in notifier.sent[0]["body"]
 
 
 def test_source_down_notice_is_not_repeated_every_cycle(cfg, state, notifier, monkeypatch):
     only_one_source(cfg)
     cfg.quiet_hours_enabled = False
-    state.record_success("reddit_test", datetime.now(timezone.utc) - timedelta(hours=3))
     monkeypatch.setattr(runner, "fetch_feed", stub_fetch([], ok=False, error="HTTP 500"))
+    runner.poll(cfg, state, notifier)
+    state.data["sources"]["reddit_test"]["failing_since"] = (
+        datetime.now(timezone.utc) - timedelta(hours=3)
+    ).isoformat()
 
-    for _ in range(5):
+    for _ in range(8):
         runner.poll(cfg, state, notifier)
 
     assert len(notifier.sent) == 1, "source-down notice repeated too often"
@@ -169,12 +177,12 @@ def test_brief_failure_does_not_trigger_a_notice(cfg, state, notifier, monkeypat
     """A source that failed 10 minutes ago is a blip, not an outage."""
     only_one_source(cfg)
     cfg.quiet_hours_enabled = False
-    state.record_success("reddit_test", datetime.now(timezone.utc) - timedelta(minutes=10))
     monkeypatch.setattr(runner, "fetch_feed", stub_fetch([], ok=False, error="HTTP 500"))
 
-    runner.poll(cfg, state, notifier)
+    for _ in range(4):
+        runner.poll(cfg, state, notifier)
 
-    assert notifier.sent == []
+    assert notifier.sent == [], "alarmed on a brief blip"
 
 
 def test_working_source_never_triggers_a_notice(cfg, state, notifier, monkeypatch):
@@ -194,9 +202,12 @@ def test_working_source_never_triggers_a_notice(cfg, state, notifier, monkeypatc
 def test_recovery_clears_the_alarm(cfg, state, notifier, monkeypatch):
     only_one_source(cfg)
     cfg.quiet_hours_enabled = False
-    state.record_success("reddit_test", datetime.now(timezone.utc) - timedelta(hours=3))
     monkeypatch.setattr(runner, "fetch_feed", stub_fetch([], ok=False, error="HTTP 500"))
     runner.poll(cfg, state, notifier)
+    state.data["sources"]["reddit_test"]["failing_since"] = (
+        datetime.now(timezone.utc) - timedelta(hours=3)
+    ).isoformat()
+    runner.poll(cfg, state, notifier); runner.poll(cfg, state, notifier)
     assert len(notifier.sent) == 1
 
     # Source comes back. No further notices, ever.
@@ -217,6 +228,19 @@ def test_daily_source_is_not_reported_down_by_the_five_minute_poller(cfg, state,
     runner.poll(cfg, state, notifier)
 
     assert notifier.sent == []
+
+
+def test_a_feed_waiting_its_turn_is_never_reported_down(cfg, state, notifier, monkeypatch):
+    """THE BUG THAT SPAMMED THE PHONE: with one feed read per cycle, the others
+    routinely go hours between reads. That is the schedule working, not an
+    outage, and must never produce a 'source is down' alert."""
+    cfg.quiet_hours_enabled = False
+    monkeypatch.setattr(runner, "fetch_feed", stub_fetch([]))   # every read succeeds
+
+    for _ in range(40):
+        runner.poll(cfg, state, notifier)
+
+    assert notifier.sent == [], "false source-down alert for a healthy rotating feed"
 
 
 def test_a_source_removed_from_config_stops_nagging(cfg, state, notifier, monkeypatch):
@@ -384,3 +408,53 @@ def test_digest_queue_cannot_grow_without_bound(cfg, state):
     assert len(state.data["digest_queue"]) <= state.MAX_DIGEST_QUEUE
     # The most recent items are the ones kept.
     assert state.data["digest_queue"][-1]["title"] == "item 999"
+
+
+# --------------------------------------------------------------------------
+# Rate limiting: Reddit 429s bursts from data-centre IPs.
+# --------------------------------------------------------------------------
+
+def test_exactly_one_feed_is_read_per_cycle(cfg, state):
+    """Measured live: the second request in a cycle gets HTTP 429 even after a
+    six-second pause. One request per cycle is the only thing Reddit allows."""
+    for _ in range(8):
+        assert len(runner.select_sources(cfg, state)) == 1
+
+
+def test_megathread_feed_gets_most_of_the_cycles(cfg, state):
+    picks = [list(runner.select_sources(cfg, state))[0] for _ in range(12)]
+    assert picks.count("reddit_comments") == 9, "megathread feed starved of cycles"
+
+
+def test_every_feed_still_gets_read(cfg, state):
+    picks = {list(runner.select_sources(cfg, state))[0] for _ in range(24)}
+    assert picks == set(cfg.sources), f"a feed was never read: {set(cfg.sources) - picks}"
+
+
+def test_only_one_request_is_made_per_cycle(cfg, state, notifier, monkeypatch):
+    monkeypatch.setattr(runner, "fetch_feed", stub_fetch([]))
+    stats = runner.poll(cfg, state, notifier)
+    assert stats["requests"] == 1, "more requests than Reddit tolerates"
+
+
+def test_retry_after_is_honoured(monkeypatch):
+    import visawatch.sources as s
+
+    class Resp:
+        status_code = 429
+        content = b""
+        text = ""
+        is_redirect = False
+        is_permanent_redirect = False
+        headers = {"Retry-After": "7200"}
+
+    class Session:
+        def get(self, *a, **k):
+            return Resp()
+
+    before = __import__("time").time()
+    result = s.fetch_feed("x", "https://www.reddit.com/r/x/.rss", session=Session())
+    assert result.ok is False
+    # Server asked for 2 hours; we must wait at least that long, not our default.
+    assert result.backoff_until - before >= 7200 - 5
+    assert result.backoff_until - before <= s.MAX_BACKOFF_SECONDS + 5
