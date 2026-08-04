@@ -74,14 +74,40 @@ def test_digest_respects_quiet_hours(cfg, notifier, monkeypatch):
 
 
 def test_quiet_hours_window_wraps_midnight(cfg):
+    """Quiet hours are measured on the USER's clock, not India's."""
+    from visawatch.notify import local_zone
+
     cfg.quiet_hours_enabled = True
+    zone = local_zone()
+
     def at(h, m=0):
-        return datetime(2026, 7, 31, h, m, tzinfo=IST)
+        return datetime(2026, 7, 31, h, m, tzinfo=zone)
+
     assert in_quiet_hours(cfg, at(23, 30)) is True
     assert in_quiet_hours(cfg, at(3, 0)) is True
     assert in_quiet_hours(cfg, at(6, 59)) is True
     assert in_quiet_hours(cfg, at(7, 0)) is False
     assert in_quiet_hours(cfg, at(14, 0)) is False
+
+
+def test_quiet_hours_are_not_evaluated_in_india_time(cfg):
+    """THE BUG THIS GUARDS: quiet hours used to be compared against IST. For a
+    Phoenix user that made 23:00-07:00 IST mean 10:30-18:30 local - the middle
+    of the working day - so digests were muted all day and delivered at night."""
+    from visawatch.notify import IST, local_zone
+
+    zone = local_zone()
+    if zone is IST:
+        pytest.skip("config has no non-IST timezone set")
+
+    cfg.quiet_hours_enabled = True
+    # Local mid-afternoon must never count as quiet, whatever it is in IST.
+    afternoon_local = datetime(2026, 7, 31, 15, 0, tzinfo=zone)
+    assert in_quiet_hours(cfg, afternoon_local) is False
+
+    # Local small hours must always count as quiet, whatever it is in IST.
+    night_local = datetime(2026, 7, 31, 2, 0, tzinfo=zone)
+    assert in_quiet_hours(cfg, night_local) is True
 
 
 def test_backoff_on_429_and_403(monkeypatch):
