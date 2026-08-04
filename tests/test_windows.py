@@ -35,10 +35,31 @@ def test_fires_in_the_lead_period_before_a_window(wcfg, state):
     assert win.due_window(wcfg, state, at(*EVENING_LEAD)) is not None
 
 
-def test_does_not_fire_long_before_or_after(wcfg, state):
+def test_does_not_fire_outside_a_window(wcfg, state):
     assert win.due_window(wcfg, state, at(2, 0)) is None
     assert win.due_window(wcfg, state, at(12, 0)) is None
-    assert win.due_window(wcfg, state, at(6, 30)) is None, "window already open"
+    assert win.due_window(wcfg, state, at(23, 30)) is None, "window already closed"
+
+
+def test_still_fires_once_the_window_has_opened(wcfg, state, cfg, notifier):
+    """THE GAP THIS CLOSES: the ping can only be sent while a GitHub Actions run
+    is alive, and GitHub's schedule is unreliable enough that a 20-minute trigger
+    band gets missed outright. Firing late beats not firing."""
+    w = win.due_window(wcfg, state, at(6, 30))
+    assert w is not None, "no alert at all once the window had opened"
+
+    runner.send_headsup(cfg, state, notifier, now_ist=at(6, 30))
+    sent = notifier.sent[0]
+    assert "OPEN NOW" in sent["title"]
+    assert "60 min ago" in sent["body"]
+
+    # ...and still only once for that day.
+    assert win.due_window(wcfg, state, at(6, 35)) is None, "repeat ping inside the window"
+
+
+def test_a_late_ping_does_not_steal_tomorrows(wcfg, state, cfg, notifier):
+    runner.send_headsup(cfg, state, notifier, now_ist=at(6, 30))
+    assert win.due_window(wcfg, state, at(*MORNING_LEAD, day=5)) is not None
 
 
 def test_fires_once_per_window_per_day(wcfg, state):
@@ -81,6 +102,7 @@ def test_alert_states_the_window_in_the_users_own_clock(cfg, state, notifier):
     runner.send_headsup(cfg, state, notifier, now_ist=at(*MORNING_LEAD))
     body = notifier.sent[0]["body"]
     assert "05:30 IST" in body
+    assert "in 20 min" in body, "must say how long you have"
     if local_zone() is not _IST:
         assert "your time" in body
         # 05:30 IST is 17:00 in Phoenix the previous day.
