@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .notify import IST
+from .notify import IST, local_zone
 
 # Measured lift vs baseline Reddit activity, by IST hour. Kept for reference and
 # for the alert text; the windows below are derived from it.
@@ -176,30 +176,56 @@ def peak_hour(window: Window) -> tuple[int, float] | None:
     return max(inside, key=lambda x: x[1]) if inside else None
 
 
-def message(window: Window, cfg) -> tuple[str, str]:
+def upcoming_start(window: Window, now_ist: datetime) -> datetime:
+    """The next moment this window opens, at or after now."""
+    opens = window.start_on(now_ist)
+    if opens < now_ist:
+        opens = window.start_on(now_ist + timedelta(days=1))
+    return opens
+
+
+def message(window: Window, cfg, now_ist: datetime | None = None) -> tuple[str, str]:
+    now_ist = now_ist or datetime.now(IST)
+    opens_ist = upcoming_start(window, now_ist)
+
+    zone = local_zone()
+    local_line = ""
+    if zone is not IST:
+        opens_local = opens_ist.astimezone(zone)
+        # "today"/"tomorrow" from the reader's point of view, not India's.
+        same_day = opens_local.date() == now_ist.astimezone(zone).date()
+        when = "today" if same_day else opens_local.strftime("%a")
+        local_line = (
+            f"That is {opens_local.strftime('%H:%M')} {when} your time "
+            f"({opens_local.tzname()})."
+        )
+
     peak = peak_hour(window)
     evidence = (
         f"Slot-drop chatter peaks at {peak[0]:02d}:00 IST - {peak[1]:.1f}x the "
-        "normal rate for these subreddits."
+        "normal rate. It shows up in both India-based and US-based subreddits, "
+        "so it is a real release pattern, not just when people are awake."
         if peak
         else "Historically an above-average window for slot-drop reports."
     )
+
     title = f"Slot window opening - {window.label()}"
-    body = "\n".join(
-        [
-            f"A likely release window starts at {window.start_hour:02d}:{window.start_minute:02d} IST.",
-            "",
-            evidence,
-            "Measured over 346 slot-drop posts in a year, compared against normal",
-            "posting activity. It is a tendency, not a schedule - some days nothing drops.",
-            "",
-            "Batches are reported to fill within minutes, so being logged in and",
-            "refreshing beats reacting to any alert.",
-            "",
-            f"Log in here: {cfg.portal_link}",
-        ]
-    )
-    return title, body
+    lines = [
+        f"A likely release window starts at {window.start_hour:02d}:{window.start_minute:02d} IST.",
+    ]
+    if local_line:
+        lines.append(local_line)
+    lines += [
+        "",
+        evidence,
+        "A tendency, not a schedule - some days nothing drops.",
+        "",
+        "Batches are reported to fill within minutes, so being logged in and",
+        "refreshing beats reacting to any alert.",
+        "",
+        f"Log in here: {cfg.portal_link}",
+    ]
+    return title, "\n".join(lines)
 
 
 def record_observation(state, published_ist_hour: int) -> None:
