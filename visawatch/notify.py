@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import configparser
 import os
 import smtplib
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone, timedelta
 from email.message import EmailMessage
+from pathlib import Path
 
 import requests
 
@@ -14,16 +16,52 @@ from .sources import USER_AGENT
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.ini"
+_ZONE_CACHE: dict = {}
+
+
+def local_zone(path=None):
+    """YOUR timezone, from [you] timezone in config.ini.
+
+    Two different clocks matter in this project and confusing them is a real bug:
+
+      * Release windows are IST, because the consulates and their scheduling
+        systems run on India time no matter where the applicant is sitting.
+      * Quiet hours are LOCAL, because they are about when you are asleep.
+
+    Getting this wrong inverts quiet hours for anyone outside India - for
+    Phoenix, 23:00-07:00 IST is 10:30-18:30 local, i.e. the middle of the
+    working day.
+    """
+    key = str(path or _CONFIG_PATH)
+    if key in _ZONE_CACHE:
+        return _ZONE_CACHE[key]
+    zone = IST
+    try:
+        from zoneinfo import ZoneInfo
+
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(key, encoding="utf-8")
+        name = parser.get("you", "timezone", fallback="").strip()
+        if name:
+            zone = ZoneInfo(name)
+    except Exception:
+        zone = IST      # unknown or missing zone must never break alerting
+    _ZONE_CACHE[key] = zone
+    return zone
+
 
 class NotifierError(RuntimeError):
     pass
 
 
-def in_quiet_hours(cfg, now_ist: datetime | None = None) -> bool:
+def in_quiet_hours(cfg, now: datetime | None = None) -> bool:
+    """Quiet hours are measured on YOUR clock, not India's."""
     if not cfg.quiet_hours_enabled:
         return False
-    now_ist = now_ist or datetime.now(IST)
-    current: time = now_ist.time()
+    zone = local_zone()
+    now = (now or datetime.now(zone)).astimezone(zone)
+    current: time = now.time()
     start, end = cfg.quiet_start, cfg.quiet_end
     if start == end:
         return False
