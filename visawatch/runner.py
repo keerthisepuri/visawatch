@@ -119,10 +119,10 @@ def send_headsup(cfg, state, notifier: Notifier, now_ist: datetime | None = None
         print(f"Quiet hours - holding heads-up for {window.label()}.")
         return False
 
-    title, body = win.message(window, cfg)
+    title, body = win.message(window, cfg, now_ist, wcfg.lead_minutes)
     try:
         notifier._push(title, body, cfg.urgent_priority, "alarm_clock", click=cfg.portal_link)
-        win.mark_sent(state, window, now_ist)
+        win.mark_sent(state, window, now_ist, wcfg.lead_minutes)
         print(f"Heads-up sent for {window.label()}.")
         return True
     except Exception as exc:
