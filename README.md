@@ -57,6 +57,12 @@ VisaWatch makes no weekday claim.
 So VisaWatch pings you **20 minutes before** each window. That ping is the
 important notification. Everything else is a bonus.
 
+If GitHub's scheduling means nothing is running during those 20 minutes,
+VisaWatch still pings you once the window has already opened — the message then
+says **OPEN NOW**. Firing late beats not firing: simulated against a schedule
+with 45-minute holes in it, that lifts the share of windows you actually hear
+about from 70% to 100%.
+
 **A tendency, not a schedule.** Some days nothing drops. This tells you when the
 odds are better, not when a slot is guaranteed.
 
