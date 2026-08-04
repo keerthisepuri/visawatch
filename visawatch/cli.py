@@ -43,8 +43,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "poll":
             stats = runner.poll(cfg, state, notifier)
             print(
-                f"Polled {len(cfg.sources)} feeds: {stats['fetched']} items, "
-                f"{stats['new']} new, {stats['urgent']} urgent, {stats['queued']} queued."
+                f"Read {stats['requests']} of {len(cfg.sources)} feeds this cycle "
+                f"(one per cycle, to stay inside Reddit's rate limit): "
+                f"{stats['fetched']} items, {stats['new']} new, "
+                f"{stats['urgent']} urgent, {stats['queued']} queued."
             )
             if stats["cold_start"]:
                 print(
