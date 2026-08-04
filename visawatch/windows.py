@@ -74,6 +74,14 @@ class Window:
             hour=self.start_hour, minute=self.start_minute, second=0, microsecond=0
         )
 
+    def end_on(self, day: datetime) -> datetime:
+        end = day.replace(
+            hour=self.end_hour, minute=self.end_minute, second=0, microsecond=0
+        )
+        if end <= self.start_on(day):        # a window that runs past midnight
+            end += timedelta(days=1)
+        return end
+
     def label(self) -> str:
         return f"{self.start_hour:02d}:{self.start_minute:02d}-{self.end_hour:02d}:{self.end_minute:02d} IST"
 
@@ -132,12 +140,33 @@ def load_window_config(path: str | Path | None = None) -> WindowConfig:
     )
 
 
+def active_day(window: Window, now_ist: datetime, lead_minutes: int) -> datetime | None:
+    """Which calendar day's occurrence of this window covers now_ist, or None.
+
+    'Covers' spans the lead period AND the window itself - see due_window for why
+    that matters. The three offsets handle a window whose lead period or tail
+    falls on the other side of midnight.
+    """
+    for offset in (0, -1, 1):
+        day = now_ist + timedelta(days=offset)
+        if window.start_on(day) - timedelta(minutes=lead_minutes) <= now_ist < window.end_on(day):
+            return day
+    return None
+
+
 def due_window(wcfg: WindowConfig, state, now_ist: datetime | None = None) -> Window | None:
     """The window whose heads-up should be sent right now, or None.
 
-    Fires once per window per day, in the lead_minutes before it opens. Because
-    polling is every ~5 minutes we accept anything inside the lead period rather
-    than requiring an exact moment, and dedupe on a per-day key.
+    Fires once per window per day, and fires anywhere from lead_minutes before
+    the window opens until it closes.
+
+    WHY THE WHOLE WINDOW AND NOT JUST THE LEAD PERIOD: the ping can only be sent
+    while a GitHub Actions run happens to be alive, and GitHub's schedule is
+    best-effort - measured on this repo, a */5 cron fired 46 times in three days
+    instead of ~860. A 20-minute trigger band is narrow enough that an ordinary
+    scheduling gap would silently swallow the alert for that day. Firing late is
+    far better than not firing: 'the window is open now' is still actionable,
+    'you missed it entirely' is not.
     """
     if not wcfg.enabled or not wcfg.windows:
         return None
@@ -145,18 +174,18 @@ def due_window(wcfg: WindowConfig, state, now_ist: datetime | None = None) -> Wi
     sent = state.data.setdefault("headsup_sent", {})
 
     for w in wcfg.windows:
-        for day_offset in (0, 1):     # tonight's window may belong to tomorrow
-            day = now_ist + timedelta(days=day_offset)
-            opens = w.start_on(day)
-            lead_starts = opens - timedelta(minutes=wcfg.lead_minutes)
-            if lead_starts <= now_ist < opens and w.key(day) not in sent:
-                return w
+        day = active_day(w, now_ist, wcfg.lead_minutes)
+        if day is not None and w.key(day) not in sent:
+            return w
     return None
 
 
-def mark_sent(state, window: Window, now_ist: datetime | None = None) -> None:
+def mark_sent(state, window: Window, now_ist: datetime | None = None,
+              lead_minutes: int = DEFAULT_LEAD_MINUTES) -> None:
     now_ist = now_ist or datetime.now(IST)
-    day = now_ist if now_ist.hour <= window.start_hour else now_ist + timedelta(days=1)
+    day = active_day(window, now_ist, lead_minutes)
+    if day is None:      # marking outside the window at all; fall back to the next one
+        day = now_ist if now_ist.hour <= window.start_hour else now_ist + timedelta(days=1)
     sent = state.data.setdefault("headsup_sent", {})
     sent[window.key(day)] = now_ist.isoformat()
     # Keep only the last 30 keys; this dict is written to the state branch.
@@ -184,9 +213,13 @@ def upcoming_start(window: Window, now_ist: datetime) -> datetime:
     return opens
 
 
-def message(window: Window, cfg, now_ist: datetime | None = None) -> tuple[str, str]:
+def message(window: Window, cfg, now_ist: datetime | None = None,
+            lead_minutes: int = DEFAULT_LEAD_MINUTES) -> tuple[str, str]:
     now_ist = now_ist or datetime.now(IST)
-    opens_ist = upcoming_start(window, now_ist)
+    day = active_day(window, now_ist, lead_minutes)
+    opens_ist = window.start_on(day) if day is not None else upcoming_start(window, now_ist)
+    already_open = now_ist >= opens_ist
+    minutes = int(round(abs((opens_ist - now_ist).total_seconds()) / 60))
 
     zone = local_zone()
     local_line = ""
@@ -209,10 +242,15 @@ def message(window: Window, cfg, now_ist: datetime | None = None) -> tuple[str, 
         else "Historically an above-average window for slot-drop reports."
     )
 
-    title = f"Slot window opening - {window.label()}"
-    lines = [
-        f"A likely release window starts at {window.start_hour:02d}:{window.start_minute:02d} IST.",
-    ]
+    start_txt = f"{window.start_hour:02d}:{window.start_minute:02d} IST"
+    if already_open:
+        title = f"Slot window OPEN NOW - {window.label()}"
+        opening = f"A likely release window is open now - it started at {start_txt}, {minutes} min ago."
+    else:
+        title = f"Slot window opening - {window.label()}"
+        opening = f"A likely release window starts at {start_txt}, in {minutes} min."
+
+    lines = [opening]
     if local_line:
         lines.append(local_line)
     lines += [
