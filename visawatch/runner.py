@@ -8,9 +8,10 @@ from datetime import datetime, timezone
 import requests
 
 from .matcher import match
-from .notify import IST, Notifier
+from .notify import IST, Notifier, in_quiet_hours
 from .sources import fetch_feed
 from . import waittimes as wt
+from . import windows as win
 
 
 # Reddit rate-limits data-centre IPs hard: measured live, the FIRST request of a
@@ -100,6 +101,35 @@ def failing_sources(cfg, state, now: datetime) -> list[dict]:
     return down
 
 
+def send_headsup(cfg, state, notifier: Notifier, now_ist: datetime | None = None) -> bool:
+    """Warn just before a likely release window, so you are logged in and
+    refreshing rather than reacting to an alert that arrives too late."""
+    wcfg = getattr(cfg, "_window_config", None) or win.load_window_config()
+    cfg._window_config = wcfg
+
+    now_ist = now_ist or datetime.now(IST)
+    window = win.due_window(wcfg, state, now_ist)
+    if window is None:
+        return False
+
+    # The morning window sits inside normal quiet hours. Suppressing it would
+    # defeat the point, so heads-ups bypass quiet hours by default - but that is
+    # a config switch, because being woken at 05:40 every day is a real cost.
+    if not wcfg.bypass_quiet_hours and in_quiet_hours(cfg, now_ist):
+        print(f"Quiet hours - holding heads-up for {window.label()}.")
+        return False
+
+    title, body = win.message(window, cfg)
+    try:
+        notifier._push(title, body, cfg.urgent_priority, "alarm_clock", click=cfg.portal_link)
+        win.mark_sent(state, window, now_ist)
+        print(f"Heads-up sent for {window.label()}.")
+        return True
+    except Exception as exc:
+        print(f"Heads-up push failed: {exc}")
+        return False
+
+
 def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
     """Read every feed once, alert on fresh matches, queue stale ones."""
     now = now or datetime.now(timezone.utc)
@@ -154,6 +184,11 @@ def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
             if not m.matched:
                 continue
 
+            # Feed the timing histogram so the windows can be re-tested against
+            # fresh data later rather than trusting one measurement forever.
+            if item.published_known:
+                win.record_observation(state, item.published.astimezone(IST).hour)
+
             age = item.age_minutes(now)
             if cold_start:
                 continue
@@ -186,6 +221,8 @@ def poll(cfg, state, notifier: Notifier, now: datetime | None = None) -> dict:
 
     if any_success:
         state.data["initialized"] = True
+
+    send_headsup(cfg, state, notifier)
 
     for down in failing_sources(cfg, state, now):
         try:
