@@ -2,8 +2,8 @@ name: VisaWatch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"    # poll the Reddit feeds
-    - cron: "30 3 * * *"     # 09:00 IST - wait times + daily digest
+    - cron: "*/5 * * * *"    # see the note on the polling loop below
+    - cron: "30 3 * * *"     # 09:00 IST - daily digest
   workflow_dispatch:
     inputs:
       mode:
@@ -25,7 +25,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 70
 
     steps:
       - uses: actions/checkout@v4
@@ -48,11 +48,31 @@ jobs:
       - name: Install dependencies
         run: pip install --quiet requests feedparser
 
-      - name: Install browser (daily run only)
-        if: steps.mode.outputs.mode == 'daily'
+      # Saves state.json to a one-commit "state" branch using git plumbing, so
+      # it never touches the working tree, the index or the current branch. That
+      # matters because it is called after every poll inside the loop below.
+      - name: Write the state-saving helper
         run: |
-          pip install --quiet playwright
-          python -m playwright install --with-deps chromium
+          cat > /tmp/save-state.sh <<'HELPER'
+          [ -f state.json ] || { echo "Nothing to save."; exit 0; }
+          export GIT_AUTHOR_NAME="visawatch-bot"
+          export GIT_AUTHOR_EMAIL="visawatch-bot@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          blob=$(git hash-object -w state.json) || exit 0
+          tree=$(printf '100644 blob %s\tstate.json\n' "$blob" | git mktree) || exit 0
+          commit=$(git commit-tree "$tree" -m "VisaWatch state") || exit 0
+          for attempt in 1 2 3; do
+            if git push --quiet --force origin "$commit:refs/heads/state"; then
+              echo "State saved ($(wc -c < state.json) bytes)."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::Could not save state; the next poll will retry."
+          exit 0
+          HELPER
+          chmod +x /tmp/save-state.sh
 
       - name: Load what we have already seen
         if: steps.mode.outputs.mode != 'test-alert'
@@ -65,7 +85,46 @@ jobs:
             echo "No saved state yet - starting fresh."
           fi
 
+      # MEASURED 3 AUG 2026: GitHub does NOT honour the */5 schedule. Over three
+      # days it fired 46 times instead of ~860 - a median gap of 74 minutes, worst
+      # 227. Every run was green; GitHub was simply skipping them. With a 74-minute
+      # gap almost nothing is under 15 minutes old when first seen, so every match
+      # fell through to the digest and no urgent alert ever fired. That is exactly
+      # why the phone stayed silent.
+      #
+      # The fix: stop relying on the schedule for cadence. Each run polls in a loop
+      # for 55 minutes, so real polling is every 5 minutes while a run is alive,
+      # and the erratic schedule only decides when a run starts.
+      - name: Poll in a loop (real 5-minute cadence)
+        if: steps.mode.outputs.mode == 'poll'
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          LOOP_MINUTES: "55"
+          POLL_SECONDS: "300"
+        run: |
+          deadline=$(( SECONDS + LOOP_MINUTES * 60 ))
+          n=0
+          while [ $SECONDS -lt $deadline ]; do
+            n=$(( n + 1 ))
+            echo "--- poll $n ---"
+            python -m visawatch poll || echo "poll failed, continuing"
+            bash /tmp/save-state.sh || echo "state save failed, continuing"
+            remaining=$(( deadline - SECONDS ))
+            # Must be an if, not "[ ... ] && break": steps run under bash -e, so a
+            # false test as the last command of the loop would fail the whole step.
+            if [ "$remaining" -le 60 ]; then
+              break
+            fi
+            if [ "$remaining" -lt "$POLL_SECONDS" ]; then
+              sleep "$remaining"
+            else
+              sleep "$POLL_SECONDS"
+            fi
+          done
+          echo "Completed $n polls in this run."
+
       - name: Run VisaWatch
+        if: steps.mode.outputs.mode != 'poll'
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           EMAIL_TO:   ${{ secrets.EMAIL_TO }}
@@ -76,29 +135,6 @@ jobs:
           SMTP_FROM:  ${{ secrets.SMTP_FROM }}
         run: python -m visawatch ${{ steps.mode.outputs.mode }}
 
-      # Saved to a separate "state" branch holding exactly one commit, so this
-      # runs 288 times a day without piling up history or hitting merge races.
       - name: Remember what we have seen
-        if: always() && steps.mode.outputs.mode != 'test-alert'
-        run: |
-          set -uo pipefail
-          [ -f state.json ] || { echo "Nothing to save."; exit 0; }
-
-          git config user.name  "visawatch-bot"
-          git config user.email "visawatch-bot@users.noreply.github.com"
-
-          git checkout --quiet --orphan state-tmp
-          git rm -rq --cached . || true
-          git add -f state.json
-          git commit --quiet -m "VisaWatch state"
-
-          for attempt in 1 2 3; do
-            if git push --quiet --force origin state-tmp:state; then
-              echo "State saved ($(wc -c < state.json) bytes)."
-              exit 0
-            fi
-            echo "Save attempt ${attempt} failed; retrying in 5s."
-            sleep 5
-          done
-          echo "::warning::Could not save state this cycle."
-          exit 0
+        if: always() && steps.mode.outputs.mode == 'daily'
+        run: bash /tmp/save-state.sh
