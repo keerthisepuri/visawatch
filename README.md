@@ -54,6 +54,28 @@ Two different things, and they need different responses.
 | When | Reported as unpredictable | Around **minute :00 and :30** of every hour |
 | What to do | Cannot be planned for. This is what the Reddit alerts are for, weak as they are. | **Be on the calendar at :55 and :25.** This is what VisaWatch's pings are for. |
 
+### First, check whether you are in a queue worth hunting at all
+
+This should be step one, and for a long time this project skipped it. From the
+State Department's own table, **last updated 21 Jul 2026** — next available
+appointment:
+
+| Consulate | Petition-based (H/L/O/P/Q) | B1/B2 |
+|---|---|---|
+| **New Delhi** | **1.5 months** | 8.5 months |
+| **Mumbai** | **1.5 months** | 8.5 months |
+| **Kolkata** | **1.5 months** | 2 months |
+| Hyderabad | 5 months | 10.5 months |
+| Chennai | no data | 7 months |
+
+Two things follow. The 8–11 month waits that dominate the slot subreddits are
+**visitor visas**, a different queue from yours. And **Hyderabad is 5 months
+while Kolkata is 1.5** — you may apply at any post in India regardless of where
+you live, so changing one dropdown is worth more than any amount of refreshing.
+
+Re-check that page before you invest effort. If your category and post show a
+tolerable wait, book it and stop reading.
+
 The :00/:30 cadence is the useful one because it repeats. It is also **portal
 behaviour rather than crowd behaviour**, which is why it is worth setting your
 day by — a pattern in how the booking system returns cancelled appointments is a
@@ -165,10 +187,17 @@ cycle picks it up.
 | `exclude` | Phrases that cancel a match. Add to this when you get noise. |
 | `[quiet_hours]` | When digests stay silent. **Your local time.** Slot alerts always ignore these. |
 
-**Current setting: 09:00–21:00, every :00 and :30 — 25 pings a day.** That is
-deliberate and it is a lot. If it becomes wallpaper you will start ignoring it,
-which is worse than not having it. Narrow `active_hours` the moment that starts
-happening.
+**Current setting: one session, 18:00–18:30 — 2 pings a day** (17:55 and 18:25).
+
+This was briefly 09:00–21:00, which is 25 pings a day. That was a bad call:
+past about six, an alert stops being a prompt and becomes wallpaper, and one
+you have trained yourself to swipe away is worse than none. A test now fails if
+any config change pushes the daily count above six.
+
+Two a day is the right dose because **petition-based (H/L/O/P/Q) waits at
+Delhi, Mumbai and Kolkata were 1.5 months as of 21 Jul 2026** — a queue you
+join, not a race you win. Widen `active_hours` only if you have already booked
+and are hunting a materially earlier date.
 
 ---
 
@@ -187,9 +216,9 @@ so the schedule only has to succeed once an hour. Cadence is now real.
 
 **What that means for the pings.** A ping fires if a polling cycle lands in the
 7-minute band around its tick. Simulated against a schedule with 45-minute
-holes, about **60% of pings get through** — roughly 15 of 25 on a typical day.
-That is fine here, unlike the old window design where a missed ping meant a
-missed day: there are 25 chances a day and you also have a clock.
+holes, about **60% of pings get through**. That is survivable because the ping
+is a nudge, not the mechanism — you also have a clock, and at a 1.5-month wait
+missing one session costs you nothing.
 
 **One feed per cycle.** Reddit rate-limits data-centre IPs hard — measured live,
 the second request in a cycle gets HTTP 429 even six seconds later. So VisaWatch
@@ -357,5 +386,5 @@ fires twice (even across restarts), a stale item goes to the digest instead of
 an urgent push, and a genuinely failing source produces a source-down notice.
 They also assert that the booking portals can never be contacted — the test
 tries, and requires the code to refuse — that quiet hours are evaluated on your
-clock rather than India's, and that a full day of check pings comes to exactly
-25 rather than silently drifting upward into your pocket.
+clock rather than India's, and that a full day of check pings stays under six
+rather than silently drifting upward into your pocket.
