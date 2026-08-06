@@ -102,39 +102,39 @@ def test_days_are_respected(state):
 # What it says
 # --------------------------------------------------------------------------
 
-def test_ping_names_a_real_clock_time_in_both_zones(cfg, state, notifier):
-    runner.send_headsup(cfg, state, notifier, now_ist=at(10, 55))
+def test_ping_names_a_real_clock_time_in_both_zones(ticking_cfg, state, notifier):
+    runner.send_headsup(ticking_cfg, state, notifier, now_ist=at(10, 55))
     sent = notifier.sent[0]
     assert "11:00" in sent["body"], "must name the local moment"
     assert "IST" in sent["body"], "must name the India moment too"
-    assert cfg.portal_link in sent["body"]
+    assert ticking_cfg.portal_link in sent["body"]
 
 
-def test_ping_teaches_the_page_load_trick(cfg, state, notifier):
+def test_ping_teaches_the_page_load_trick(ticking_cfg, state, notifier):
     """The 20-load budget is the real scarce resource. A ping that just says
     'check now' burns it; the dropdown re-query costs nothing."""
-    runner.send_headsup(cfg, state, notifier, now_ist=at(10, 55))
+    runner.send_headsup(ticking_cfg, state, notifier, now_ist=at(10, 55))
     body = notifier.sent[0]["body"]
     assert "not reload" in body.lower()
     assert "dropdown" in body.lower()
 
 
-def test_first_ping_of_the_day_carries_the_full_protocol(cfg, state, notifier):
-    runner.send_headsup(cfg, state, notifier, now_ist=at(9, 55))
+def test_first_ping_of_the_day_carries_the_full_protocol(ticking_cfg, state, notifier):
+    runner.send_headsup(ticking_cfg, state, notifier, now_ist=at(9, 55))
     first = notifier.sent[0]["body"]
     assert "reset" in first.lower(), "must say when the load budget resets"
     assert "rate limit" in first.lower()
     assert "verify" in first.lower(), "must not claim to have checked the portal"
 
-    runner.send_headsup(cfg, state, notifier, now_ist=at(10, 25))
+    runner.send_headsup(ticking_cfg, state, notifier, now_ist=at(10, 25))
     later = notifier.sent[1]["body"]
     assert "rate limit" not in later.lower(), "protocol repeated on every ping"
     assert len(later) < len(first)
 
 
-def test_ping_priority_is_below_a_real_slot_report(cfg, state, notifier):
-    runner.send_headsup(cfg, state, notifier, now_ist=at(10, 55))
-    assert notifier.sent[0]["priority"] < cfg.urgent_priority
+def test_ping_priority_is_below_a_real_slot_report(ticking_cfg, state, notifier):
+    runner.send_headsup(ticking_cfg, state, notifier, now_ist=at(10, 55))
+    assert notifier.sent[0]["priority"] < ticking_cfg.urgent_priority
 
 
 def test_quiet_hours_suppress_and_do_not_fire_late(cfg, state, notifier, monkeypatch):
@@ -154,13 +154,13 @@ def test_quiet_hours_suppress_and_do_not_fire_late(cfg, state, notifier, monkeyp
 # Bookkeeping
 # --------------------------------------------------------------------------
 
-def test_a_full_day_produces_the_expected_number_of_pings(cfg, state, notifier):
+def test_a_full_day_produces_the_expected_number_of_pings(ticking_cfg, state, notifier):
     """09:00-21:00 at two ticks an hour = 25 pings. If this number ever drifts,
     it is drifting straight into the user's pocket."""
     t = at(0, 0)
     end = t + timedelta(days=1)
     while t < end:
-        runner.send_headsup(cfg, state, notifier, now_ist=t)
+        runner.send_headsup(ticking_cfg, state, notifier, now_ist=t)
         t += timedelta(minutes=5)
     assert len(notifier.sent) == 25
 
