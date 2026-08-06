@@ -102,31 +102,39 @@ def failing_sources(cfg, state, now: datetime) -> list[dict]:
 
 
 def send_headsup(cfg, state, notifier: Notifier, now_ist: datetime | None = None) -> bool:
-    """Warn just before a likely release window, so you are logged in and
-    refreshing rather than reacting to an alert that arrives too late."""
-    wcfg = getattr(cfg, "_window_config", None) or win.load_window_config()
-    cfg._window_config = wcfg
+    """Ping shortly before each :00 and :30, so you are already parked on the
+    calendar re-querying the dropdown when cancellations return to the pool.
 
-    now_ist = now_ist or datetime.now(IST)
-    window = win.due_window(wcfg, state, now_ist)
-    if window is None:
+    This deliberately does NOT claim to know when slots exist. VisaWatch cannot
+    see the portal, and the release-window theory it used to ship did not survive
+    re-testing - see windows.py for the post-mortem.
+    """
+    ccfg = getattr(cfg, "_window_config", None) or win.load_window_config()
+    cfg._window_config = ccfg
+
+    now = now_ist or datetime.now(IST)
+    tick = win.due_window(ccfg, state, now)
+    if tick is None:
         return False
 
-    # The morning window sits inside normal quiet hours. Suppressing it would
-    # defeat the point, so heads-ups bypass quiet hours by default - but that is
-    # a config switch, because being woken at 05:40 every day is a real cost.
-    if not wcfg.bypass_quiet_hours and in_quiet_hours(cfg, now_ist):
-        print(f"Quiet hours - holding heads-up for {window.label()}.")
+    # Active hours are chosen in local time and normally sit outside quiet hours
+    # entirely, so this is a backstop rather than the common case.
+    if not ccfg.bypass_quiet_hours and in_quiet_hours(cfg, now):
+        print(f"Quiet hours - skipping the :{tick.minute:02d} check ping.")
+        win.mark_sent(state, tick, now)      # don't fire it late once they end
         return False
 
-    title, body = win.message(window, cfg, now_ist, wcfg.lead_minutes)
+    first = win.is_first_of_day(state, tick)
+    title, body = win.message(tick, cfg, now, ccfg.lead_minutes, first_of_day=first)
     try:
-        notifier._push(title, body, cfg.urgent_priority, "alarm_clock", click=cfg.portal_link)
-        win.mark_sent(state, window, now_ist, wcfg.lead_minutes)
-        print(f"Heads-up sent for {window.label()}.")
+        notifier._push(title, body, ccfg.priority, "alarm_clock", click=cfg.portal_link)
+        win.mark_sent(state, tick, now)
+        if first:
+            state.data["last_protocol_day"] = tick.date().isoformat()
+        print(f"Check ping sent for {win.tick_key(tick)}.")
         return True
     except Exception as exc:
-        print(f"Heads-up push failed: {exc}")
+        print(f"Check ping failed: {exc}")
         return False
 
 
