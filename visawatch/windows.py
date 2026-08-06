@@ -1,274 +1,268 @@
-"""Release-window heads-up.
+"""When to be sitting on the calendar.
 
-WHY THIS EXISTS
----------------
-VisaWatch cannot win a race it is structurally too slow for. A slot opens, a
-human notices, a human posts, Reddit indexes it, we poll. Batches are reported
-to fill "within minutes". Reacting is a lottery.
-
-What DOES work is being logged in and refreshing when a release is likely. That
-is a signal a few minutes of lag cannot ruin.
-
-THE EVIDENCE (measured 4 Aug 2026, not folklore)
+WHY THIS REPLACED THE OLD "RELEASE WINDOW" MODEL
 ------------------------------------------------
-346 slot-drop posts across r/usvisascheduling, r/USVisaIndians and r/h1b over
-362 days, compared against 1,200 general posts from the same subreddits to
-control for "when are Indians simply awake and on Reddit".
+VisaWatch used to claim two daily release windows in IST (05:30-07:30 and
+22:00-23:00), derived from when slot-drop posts clustered on Reddit against a
+baseline of ordinary posts.
 
-    hour IST   share of slot posts / share of all posts      z
-    06:00      3.73x                                      +5.3
-    04:00      1.86x                                      +2.5
-    22:00      1.54x                                      +2.4
-    07:00      1.57x                                      +1.7
+On 6 Aug 2026 that analysis was re-run on a fresh sample of a year of posts and
+it DID NOT REPLICATE. Two things went wrong with the original:
 
-Chi-square vs baseline = 65.3 on 23 df (p < 0.01). The 06:00 result is the
-strongest and the most credible: 06:00 is one of the QUIETEST hours on those
-subreddits (1.1% of all posts) yet carries 4.0% of slot-drop posts. Nobody is
-casually browsing at 6am - they are posting because something happened.
+  1. Almost nothing in the sample was a real slot-drop report. Of 131 posts in a
+     year whose titles matched "slot" + an availability word, 57 were questions,
+     63 were narrative, and only a handful were live reports - people ASKING
+     about slots, not announcing them. The old measurement was therefore a
+     measurement of when people get frustrated and post, not of when slots open.
+  2. The daily calendar-refresh budget resets on the IST day boundary, which
+     gives everyone - in India and abroad alike - a reason to check hardest in
+     the Indian morning. That confound survives the "control for baseline
+     activity" check and survives the US-vs-India cross-check too, because the
+     reset is anchored to IST for every applicant on earth.
 
-WHAT THE DATA DOES *NOT* SUPPORT
---------------------------------
-Day of week. Chi-square 8.9 on 6 df - not significant. The community folklore
-about "Wednesday midnight" and "Friday batches" is not visible in a year of
-data, so this module deliberately makes no weekday claim.
+Re-tested against the fresh sample: chi-square 30.3 on 23 df for questions and
+19.2 for the rest, both below the 35.2 needed for p<0.05. No hour-of-day effect.
+The 06:00 IST peak is not there.
 
-IMPORTANT CAVEAT
-----------------
-This measures when people POST about slots, which lags the actual release by an
-unknown amount - minutes to tens of minutes. So the real drop is probably a
-little BEFORE these hours, which is why the heads-up fires ahead of the window
-rather than at its start.
+WHAT THIS MODULE DOES INSTEAD
+-----------------------------
+It stops predicting releases, which VisaWatch cannot observe, and instead keeps
+time against the one mechanism that is documented to repeat: cancelled
+appointments return to the pool around minute :00 and :30 of every hour.
+
+That is portal behaviour rather than crowd behaviour, which is why it is worth
+acting on. It is also NOT something VisaWatch can verify - checking would mean
+polling the booking portal, which is forbidden. Reddit post timing is the wrong
+instrument for it: a post is written minutes after the fact, which smears
+minute-of-hour into noise. Measured anyway on the fresh sample, slot posts sat
+1.17x above chance in the :00/:30 +/-4min band - the right direction, far short
+of significance at n=57. So this is taken on the community's authority, and
+labelled as such in the alert.
+
+The honest framing: this module tells you WHEN TO LOOK, not when slots exist.
 """
 
 from __future__ import annotations
 
 import configparser
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 from .notify import IST, local_zone
 
-# Measured lift vs baseline Reddit activity, by IST hour. Kept for reference and
-# for the alert text; the windows below are derived from it.
-MEASURED_LIFT = {4: 1.86, 6: 3.73, 7: 1.57, 22: 1.54}
-
-# Deliberately centred on the STRONGEST evidence (06:00, 3.7x) rather than
-# spanning every hour that showed a lift. Including 04:00 would mean a 03:40
-# wake-up every single day for a 1.9x signal - a poor trade for sleep.
-DEFAULT_WINDOWS = "05:30-07:30, 22:00-23:00"
-DEFAULT_LEAD_MINUTES = 20
+DEFAULT_ACTIVE = "09:00-21:00"
+DEFAULT_TICKS = "00, 30"
+DEFAULT_LEAD_MINUTES = 5
+DEFAULT_GRACE_MINUTES = 2
+DEFAULT_DAYS = "mon, tue, wed, thu, fri, sat, sun"
 DEFAULT_ENABLED = True
-DEFAULT_BYPASS_QUIET = True
+DEFAULT_PRIORITY = 4          # high, but below the max reserved for real reports
+DEFAULT_BYPASS_QUIET = False
+
+# The portal allows 20 full calendar page loads per applicant per day, and the
+# count resets on the IST day boundary. Quoted in the alert so the budget is
+# always in view - it is the real scarce resource, not time.
+DAILY_PAGE_LOADS = 20
+
+_DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 
 @dataclass
-class Window:
-    start_hour: int
-    start_minute: int
-    end_hour: int
-    end_minute: int
-
-    def start_on(self, day: datetime) -> datetime:
-        return day.replace(
-            hour=self.start_hour, minute=self.start_minute, second=0, microsecond=0
-        )
-
-    def end_on(self, day: datetime) -> datetime:
-        end = day.replace(
-            hour=self.end_hour, minute=self.end_minute, second=0, microsecond=0
-        )
-        if end <= self.start_on(day):        # a window that runs past midnight
-            end += timedelta(days=1)
-        return end
-
-    def label(self) -> str:
-        return f"{self.start_hour:02d}:{self.start_minute:02d}-{self.end_hour:02d}:{self.end_minute:02d} IST"
-
-    def key(self, day: datetime) -> str:
-        return f"{day.date().isoformat()}@{self.start_hour:02d}{self.start_minute:02d}"
-
-
-@dataclass
-class WindowConfig:
+class CheckConfig:
     enabled: bool = DEFAULT_ENABLED
+    active_start: time = field(default_factory=lambda: time(9, 0))
+    active_end: time = field(default_factory=lambda: time(21, 0))
+    ticks: list = None
     lead_minutes: int = DEFAULT_LEAD_MINUTES
+    grace_minutes: int = DEFAULT_GRACE_MINUTES
+    days: set = None
+    priority: int = DEFAULT_PRIORITY
     bypass_quiet_hours: bool = DEFAULT_BYPASS_QUIET
-    windows: list[Window] = None
 
     def __post_init__(self):
-        if self.windows is None:
-            self.windows = parse_windows(DEFAULT_WINDOWS)
+        if self.ticks is None:
+            self.ticks = parse_ticks(DEFAULT_TICKS)
+        if self.days is None:
+            self.days = parse_days(DEFAULT_DAYS)
 
 
-def parse_windows(raw: str) -> list[Window]:
-    """'04:00-07:00, 22:00-23:00' -> [Window, Window]. Bad entries are skipped
-    rather than crashing the poller."""
-    out: list[Window] = []
+def parse_ticks(raw: str) -> list:
+    """'00, 30' -> [0, 30]. Rubbish is skipped rather than crashing the poller."""
+    out = []
     for chunk in (raw or "").split(","):
         chunk = chunk.strip()
-        if not chunk or "-" not in chunk:
+        if not chunk.isdigit():
             continue
-        start, _, end = chunk.partition("-")
-        try:
-            sh, sm = (int(x) for x in start.strip().split(":"))
-            eh, em = (int(x) for x in end.strip().split(":"))
-        except ValueError:
-            continue
-        if 0 <= sh <= 23 and 0 <= eh <= 23:
-            out.append(Window(sh, sm, eh, em))
-    return out
+        m = int(chunk)
+        if 0 <= m <= 59 and m not in out:
+            out.append(m)
+    return sorted(out) or [0, 30]
 
 
-def load_window_config(path: str | Path | None = None) -> WindowConfig:
-    """Read the [windows] section straight from config.ini, so every knob still
-    lives in the one plain-text file."""
+def parse_days(raw: str) -> set:
+    out = set()
+    for chunk in (raw or "").split(","):
+        key = chunk.strip().lower()[:3]
+        if key in _DAY_NAMES:
+            out.add(_DAY_NAMES[key])
+    return out or set(range(7))
+
+
+def parse_hhmm(raw: str, fallback: time) -> time:
+    try:
+        h, m = (int(x) for x in raw.strip().split(":"))
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return time(h, m)
+    except (AttributeError, ValueError):
+        pass
+    return fallback
+
+
+def parse_active(raw: str) -> tuple:
+    start, _, end = (raw or "").partition("-")
+    return parse_hhmm(start, time(9, 0)), parse_hhmm(end, time(21, 0))
+
+
+def load_window_config(path: str | Path | None = None) -> CheckConfig:
+    """Read [checking] straight from config.ini, so every knob still lives in the
+    one plain-text file. Falls back to defaults if the section is missing."""
     path = Path(path) if path else Path(__file__).resolve().parent.parent / "config.ini"
     parser = configparser.ConfigParser(interpolation=None)
     try:
         parser.read(path, encoding="utf-8")
     except Exception:
-        return WindowConfig()
-    if not parser.has_section("windows"):
-        return WindowConfig()
-    s = parser["windows"]
-    return WindowConfig(
+        return CheckConfig()
+    if not parser.has_section("checking"):
+        return CheckConfig()
+    s = parser["checking"]
+    start, end = parse_active(s.get("active_hours", DEFAULT_ACTIVE))
+    return CheckConfig(
         enabled=s.getboolean("enabled", DEFAULT_ENABLED),
+        active_start=start,
+        active_end=end,
+        ticks=parse_ticks(s.get("ticks", DEFAULT_TICKS)),
         lead_minutes=s.getint("lead_minutes", DEFAULT_LEAD_MINUTES),
+        grace_minutes=s.getint("grace_minutes", DEFAULT_GRACE_MINUTES),
+        days=parse_days(s.get("days", DEFAULT_DAYS)),
+        priority=s.getint("priority", DEFAULT_PRIORITY),
         bypass_quiet_hours=s.getboolean("bypass_quiet_hours", DEFAULT_BYPASS_QUIET),
-        windows=parse_windows(s.get("windows", DEFAULT_WINDOWS)),
     )
 
 
-def active_day(window: Window, now_ist: datetime, lead_minutes: int) -> datetime | None:
-    """Which calendar day's occurrence of this window covers now_ist, or None.
+def _in_active_hours(ccfg: CheckConfig, moment: datetime) -> bool:
+    t = moment.time()
+    if ccfg.active_start <= ccfg.active_end:
+        return ccfg.active_start <= t <= ccfg.active_end
+    return t >= ccfg.active_start or t <= ccfg.active_end   # wraps midnight
 
-    'Covers' spans the lead period AND the window itself - see due_window for why
-    that matters. The three offsets handle a window whose lead period or tail
-    falls on the other side of midnight.
+
+def tick_key(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M")
+
+
+def due_window(ccfg: CheckConfig, state, now=None):
+    """The :00 or :30 moment we should be warning about right now, or None.
+
+    Returns the tick instant itself (an aware datetime in YOUR timezone), so the
+    message can name a real clock time rather than a vague window.
+
+    The acceptance band is [tick - lead, tick + grace). Polling runs about every
+    five minutes and is at the mercy of GitHub's scheduler, so an exact-moment
+    test would silently drop pings; the grace period means a slightly late cycle
+    still fires. Each tick is deduped on its own minute, so a run that polls
+    twice inside the band still only pings once.
     """
-    for offset in (0, -1, 1):
-        day = now_ist + timedelta(days=offset)
-        if window.start_on(day) - timedelta(minutes=lead_minutes) <= now_ist < window.end_on(day):
-            return day
-    return None
-
-
-def due_window(wcfg: WindowConfig, state, now_ist: datetime | None = None) -> Window | None:
-    """The window whose heads-up should be sent right now, or None.
-
-    Fires once per window per day, and fires anywhere from lead_minutes before
-    the window opens until it closes.
-
-    WHY THE WHOLE WINDOW AND NOT JUST THE LEAD PERIOD: the ping can only be sent
-    while a GitHub Actions run happens to be alive, and GitHub's schedule is
-    best-effort - measured on this repo, a */5 cron fired 46 times in three days
-    instead of ~860. A 20-minute trigger band is narrow enough that an ordinary
-    scheduling gap would silently swallow the alert for that day. Firing late is
-    far better than not firing: 'the window is open now' is still actionable,
-    'you missed it entirely' is not.
-    """
-    if not wcfg.enabled or not wcfg.windows:
+    if not ccfg.enabled or not ccfg.ticks:
         return None
-    now_ist = now_ist or datetime.now(IST)
+    zone = local_zone()
+    now = (now or datetime.now(zone)).astimezone(zone)
     sent = state.data.setdefault("headsup_sent", {})
 
-    for w in wcfg.windows:
-        day = active_day(w, now_ist, wcfg.lead_minutes)
-        if day is not None and w.key(day) not in sent:
-            return w
+    for hour_offset in (-1, 0, 1):
+        base = (now + timedelta(hours=hour_offset)).replace(second=0, microsecond=0)
+        for minute in ccfg.ticks:
+            tick = base.replace(minute=minute)
+            opens = tick - timedelta(minutes=ccfg.lead_minutes)
+            closes = tick + timedelta(minutes=ccfg.grace_minutes)
+            if not (opens <= now < closes):
+                continue
+            if tick.weekday() not in ccfg.days:
+                continue
+            if not _in_active_hours(ccfg, tick):
+                continue
+            if tick_key(tick) in sent:
+                continue
+            return tick
     return None
 
 
-def mark_sent(state, window: Window, now_ist: datetime | None = None,
-              lead_minutes: int = DEFAULT_LEAD_MINUTES) -> None:
-    now_ist = now_ist or datetime.now(IST)
-    day = active_day(window, now_ist, lead_minutes)
-    if day is None:      # marking outside the window at all; fall back to the next one
-        day = now_ist if now_ist.hour <= window.start_hour else now_ist + timedelta(days=1)
+def mark_sent(state, tick, now=None, lead_minutes: int = DEFAULT_LEAD_MINUTES) -> None:
     sent = state.data.setdefault("headsup_sent", {})
-    sent[window.key(day)] = now_ist.isoformat()
-    # Keep only the last 30 keys; this dict is written to the state branch.
-    if len(sent) > 30:
-        for k in sorted(sent)[: len(sent) - 30]:
+    sent[tick_key(tick)] = (now or tick).isoformat()
+    # Keep only the last 60 keys - a day and a bit at two ticks an hour. This
+    # dict is written to the state branch on every cycle, so it has to stay small.
+    if len(sent) > 60:
+        for k in sorted(sent)[: len(sent) - 60]:
             sent.pop(k, None)
 
 
-def peak_hour(window: Window) -> tuple[int, float] | None:
-    """The strongest measured hour inside a window - that is what the alert
-    should quote, not whichever hour the window happens to start on."""
-    inside = [
-        (h, lift)
-        for h, lift in MEASURED_LIFT.items()
-        if window.start_hour <= h <= window.end_hour
-    ]
-    return max(inside, key=lambda x: x[1]) if inside else None
-
-
-def upcoming_start(window: Window, now_ist: datetime) -> datetime:
-    """The next moment this window opens, at or after now."""
-    opens = window.start_on(now_ist)
-    if opens < now_ist:
-        opens = window.start_on(now_ist + timedelta(days=1))
-    return opens
-
-
-def message(window: Window, cfg, now_ist: datetime | None = None,
-            lead_minutes: int = DEFAULT_LEAD_MINUTES) -> tuple[str, str]:
-    now_ist = now_ist or datetime.now(IST)
-    day = active_day(window, now_ist, lead_minutes)
-    opens_ist = window.start_on(day) if day is not None else upcoming_start(window, now_ist)
-    already_open = now_ist >= opens_ist
-    minutes = int(round(abs((opens_ist - now_ist).total_seconds()) / 60))
-
-    zone = local_zone()
-    local_line = ""
-    if zone is not IST:
-        opens_local = opens_ist.astimezone(zone)
-        # "today"/"tomorrow" from the reader's point of view, not India's.
-        same_day = opens_local.date() == now_ist.astimezone(zone).date()
-        when = "today" if same_day else opens_local.strftime("%a")
-        local_line = (
-            f"That is {opens_local.strftime('%H:%M')} {when} your time "
-            f"({opens_local.tzname()})."
-        )
-
-    peak = peak_hour(window)
-    evidence = (
-        f"Slot-drop chatter peaks at {peak[0]:02d}:00 IST - {peak[1]:.1f}x the "
-        "normal rate. It shows up in both India-based and US-based subreddits, "
-        "so it is a real release pattern, not just when people are awake."
-        if peak
-        else "Historically an above-average window for slot-drop reports."
+def budget_resets_at(zone) -> str:
+    """The 20-load counter resets on the IST day boundary. For anyone outside
+    India that lands at a genuinely surprising local hour, so spell it out."""
+    tomorrow_ist = (datetime.now(IST) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
     )
+    return tomorrow_ist.astimezone(zone).strftime("%H:%M")
 
-    start_txt = f"{window.start_hour:02d}:{window.start_minute:02d} IST"
-    if already_open:
-        title = f"Slot window OPEN NOW - {window.label()}"
-        opening = f"A likely release window is open now - it started at {start_txt}, {minutes} min ago."
-    else:
-        title = f"Slot window opening - {window.label()}"
-        opening = f"A likely release window starts at {start_txt}, in {minutes} min."
 
-    lines = [opening]
-    if local_line:
-        lines.append(local_line)
-    lines += [
+def is_first_of_day(state, tick) -> bool:
+    day = tick.date().isoformat()
+    return state.data.get("last_protocol_day") != day
+
+
+def message(tick, cfg, now=None, lead_minutes: int = DEFAULT_LEAD_MINUTES,
+            first_of_day: bool = False) -> tuple:
+    """Short by design. This fires up to 24 times a day; a wall of text would be
+    ignored within a week, and an ignored alert is worse than no alert."""
+    zone = local_zone()
+    tick_ist = tick.astimezone(IST)
+    minutes = int(round((tick - (now or datetime.now(zone)).astimezone(zone)).total_seconds() / 60))
+
+    when = "now" if minutes <= 0 else f"in {minutes} min"
+    title = f"Check the calendar - :{tick.minute:02d} {when}"
+
+    lines = [
+        f"Cancellations go back into the pool around {tick.strftime('%H:%M')} "
+        f"{tick.tzname()} ({tick_ist.strftime('%H:%M IST')}).",
         "",
-        evidence,
-        "A tendency, not a schedule - some days nothing drops.",
-        "",
-        "Batches are reported to fill within minutes, so being logged in and",
-        "refreshing beats reacting to any alert.",
-        "",
-        f"Log in here: {cfg.portal_link}",
+        "Do NOT reload the page. Change the location in the dropdown and",
+        "change it back - that re-queries availability and costs you none",
+        f"of your {DAILY_PAGE_LOADS} daily calendar loads.",
     ]
+
+    if first_of_day:
+        lines += [
+            "",
+            f"First check of the day. Your {DAILY_PAGE_LOADS} calendar page",
+            f"loads reset at {budget_resets_at(zone)} {tick.tzname()} (midnight IST).",
+            "",
+            "Slow down between clicks - a burst of them is what triggers the",
+            "1015 rate limit, and it will hit you on the click that matters.",
+            "",
+            "Reported cadence, not something VisaWatch can verify - it never",
+            "touches the portal.",
+        ]
+
+    lines += ["", f"Log in here: {cfg.portal_link}"]
     return title, "\n".join(lines)
 
 
 def record_observation(state, published_ist_hour: int) -> None:
-    """Keep counting, so the windows can be re-checked against fresh data later
-    instead of trusting a one-off measurement forever."""
+    """Still counting hour-of-day, purely so the abandoned release-window theory
+    can be re-tested later against VisaWatch's own data rather than Reddit
+    search results. Nothing reads this yet, and nothing should until there are
+    enough genuine live reports in it to be worth a test."""
     counts = state.data.setdefault("hour_counts", {})
     key = str(published_ist_hour)
     counts[key] = int(counts.get(key, 0)) + 1
